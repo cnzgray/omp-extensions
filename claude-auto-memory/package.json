@@ -1,0 +1,12 @@
+{
+  "name": "claude-auto-memory",
+  "version": "1.0.0",
+  "description": "Auto-generated project memory imported from Claude Code, with bootstrap guidance injection",
+  "license": "MIT",
+  "type": "module",
+  "omp": {
+    "name": "Claude Auto Memory",
+    "description": "Auto-generated project memory",
+    "extensions": ["./index.ts"]
+  }
+}

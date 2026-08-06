@@ -1,0 +1,19 @@
+{
+  "name": "claude-rules-bridge",
+  "version": "1.0.0",
+  "description": "Bridges .claude/rules/*.md and *.mdc (Claude Code format) into omp as path-scoped rules",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "omp": {
+    "name": "Claude Rules Bridge",
+    "description": "Bridges Claude Code rules into omp",
+    "extensions": ["./index.ts"]
+  },
+  "devDependencies": {
+    "@types/picomatch": "^4.0.3",
+    "vitest": "^4.1.10"
+  }
+}

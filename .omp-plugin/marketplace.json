@@ -1,0 +1,25 @@
+{
+  "name": "omp-extensions",
+  "owner": {
+    "name": "cnzgray"
+  },
+  "metadata": {
+    "description": "Oh My Pi extensions by cnzgray: claude-auto-memory, claude-rules-bridge"
+  },
+  "plugins": [
+    {
+      "name": "claude-auto-memory",
+      "source": "./claude-auto-memory",
+      "description": "Auto-generated project memory imported from Claude Code, with bootstrap guidance injection",
+      "author": { "name": "cnzgray" },
+      "license": "MIT"
+    },
+    {
+      "name": "claude-rules-bridge",
+      "source": "./claude-rules-bridge",
+      "description": "Bridges .claude/rules/*.md and *.mdc (Claude Code format) into omp as path-scoped rules",
+      "author": { "name": "cnzgray" },
+      "license": "MIT"
+    }
+  ]
+}
