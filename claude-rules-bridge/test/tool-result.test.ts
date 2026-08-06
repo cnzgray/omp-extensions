@@ -3,13 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import claudeRulesBridge, {
-	discoverRules,
-	rules,
-	scanSubdirClaudeMds,
-	subClaudeMds,
-	type ExtensionContext,
-} from "../index";
+import claudeRulesBridge, { type ExtensionContext, injectedKeys } from "../index";
 import { createFakePi, type FakePiHarness } from "./helpers/fake-pi";
 
 interface TextPart {
@@ -53,19 +47,18 @@ beforeEach(async () => {
 	const rulesDir = join(tmp, ".claude", "rules");
 	mkdirSync(rulesDir, { recursive: true });
 	writeFileSync(join(rulesDir, "ts.md"), "---\nglobs: [\"**/*.ts\"]\n---\nUse TS rules.\n");
+	writeFileSync(join(tmp, "CLAUDE.md"), "Root project memory.\n");
 	apiDir = join(tmp, "packages", "api");
 	mkdirSync(apiDir, { recursive: true });
 	writeFileSync(join(apiDir, "CLAUDE.md"), "API package rules.\n");
-	rules.length = 0;
-	rules.push(...(await discoverRules(tmp)));
-	subClaudeMds.length = 0;
-	const sub: typeof subClaudeMds = [];
-	await scanSubdirClaudeMds(tmp, sub);
-	subClaudeMds.push(...sub);
 
 	harness = createFakePi();
 	claudeRulesBridge(harness.pi);
 	ctx = harness.makeCtx({ cwd: tmp });
+	// session_start drives reload(), which discovers rules + the cwd→home
+	// CLAUDE.md hierarchy and seeds systemPromptMdPaths (used to dedupe the
+	// dynamic layer against the system-prompt layer).
+	await harness.emit("session_start", { type: "session_start" }, ctx);
 });
 
 afterEach(() => {
@@ -73,7 +66,7 @@ afterEach(() => {
 });
 
 describe("tool_result injection (via fake pi)", () => {
-	it("appends matched rules to the first touch of a matching file", async () => {
+	it("appends matched rules + subdir CLAUDE.md to the first touch of a matching file", async () => {
 		const result = await harness.emit(
 			"tool_result",
 			makeReadEvent("packages/api/index.ts:50-200", { resolvedPath: join(apiDir, "index.ts") }),
@@ -134,5 +127,39 @@ describe("tool_result injection (via fake pi)", () => {
 		const text = injectedText(result);
 		expect(text.match(/Use TS rules\./g)).toHaveLength(1);
 		expect(text.match(/API package rules\./g)).toHaveLength(1);
+	});
+
+	it("does not re-inject a CLAUDE.md already in the system-prompt layer (cwd's own)", async () => {
+		// README.md matches no glob; upward walk reaches tmp/CLAUDE.md which
+		// reload() placed in the system-prompt layer → skipped → no injection.
+		const event = makeReadEvent("README.md", undefined);
+		const result = await harness.emit("tool_result", event, ctx);
+		expectUnchanged(result, event);
+	});
+
+	it("clears dedupe state on session_compact (reload resets injectedKeys)", async () => {
+		const event = makeReadEvent("packages/api/index.ts:50-200", { resolvedPath: join(apiDir, "index.ts") });
+		await harness.emit("tool_result", event, ctx);
+		expect(injectedKeys.size).toBeGreaterThan(0);
+		await harness.emit("session_compact", { type: "session_compact" }, ctx);
+		expect(injectedKeys.size).toBe(0);
+		// after reload, the same file can be injected again
+		const second = await harness.emit("tool_result", event, ctx);
+		expect(injectedText(second)).toContain("API package rules.");
+	});
+
+	it("toasts once per CLAUDE.md on first dynamic injection, not on sibling files", async () => {
+		await harness.emit("tool_result", makeReadEvent("packages/api/index.ts", { resolvedPath: join(apiDir, "index.ts") }), ctx);
+		expect(harness.notifications.some(n => n.message === `[claude-rules] injected: ${join(apiDir, "CLAUDE.md")}`)).toBe(true);
+		// a different file under the same CLAUDE.md dir injects again (new target key) but does NOT re-toast
+		const before = harness.notifications.length;
+		await harness.emit("tool_result", makeReadEvent("packages/api/util.ts", { resolvedPath: join(apiDir, "util.ts") }), ctx);
+		expect(harness.notifications.slice(before).some(n => n.message.startsWith("[claude-rules] injected:"))).toBe(false);
+	});
+
+	it("does not toast for path-scoped .claude/rules injections (only CLAUDE.md)", async () => {
+		await harness.emit("tool_result", makeReadEvent("packages/api/index.ts", { resolvedPath: join(apiDir, "index.ts") }), ctx);
+		// the only injected toast is the api CLAUDE.md; the ts.md rule injection must NOT toast
+		expect(harness.notifications.filter(n => n.message.startsWith("[claude-rules] injected:"))).toHaveLength(1);
 	});
 });

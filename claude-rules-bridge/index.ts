@@ -1,10 +1,29 @@
-// Claude Code .claude/rules/ bridge for omp.
+// Claude Code .claude/rules/ + CLAUDE.md bridge for omp.
 //
-// Discovers .claude/rules/*.md and *.mdc (Claude Code format) from cwd
-// (walked up to home) and from ~/.claude/rules/, then injects matching
-// rules into the provider request payload. Single source of truth for
-// rule content — files under .claude/rules/ remain editable from either
-// Claude Code or omp sessions.
+// Two complementary mechanisms:
+//
+// 1. .claude/rules/*.md and *.mdc (Claude Code rule files)
+//    Discovered from cwd (walked up to home) + ~/.claude/rules/. Frontmatter:
+//      - paths | globs | applyTo  → file-match globs (merged)
+//      - alwaysApply             → always inject regardless of cwd/files
+//      - description             → metadata for /claude-rules listing
+//    - alwaysApply rules → injected into the system prompt each agent loop.
+//    - Path-scoped rules → injected dynamically on read/edit/write tool_result
+//      when the touched file matches the globs.
+//
+// 2. CLAUDE.md files (Claude Code hierarchical memory)
+//    Mirrors Claude Code semantics:
+//    - System-prompt layer: at session start, every CLAUDE.md (and
+//      .claude/CLAUDE.md) from the session cwd up to $HOME is collected and
+//      injected once into the system prompt — the cwd's own CLAUDE.md lives
+//      here, so it is in effect from the first agent turn, not on first file
+//      touch.
+//    - Dynamic layer: on every read/edit/write tool_result we walk UP from the
+//      touched file's directory to $HOME and inject any CLAUDE.md not already
+//      in the system-prompt layer. This covers CLAUDE.md deeper than cwd
+//      (subdirectory memory) AND CLAUDE.md outside the cwd→home chain
+//      (worktrees, sibling monorepo packages) — the old "recurse cwd down 3
+//      levels" scan could do neither.
 //
 // Why before_agent_start (not before_provider_request):
 //   OMP's extensions runner consumes the systemPrompt return value and
@@ -12,32 +31,16 @@
 //   agent loop. No subsequent rebuild overwrites it (verified in omp source).
 //   (Same rationale as claude-auto-memory.ts in this directory.)
 //
-// Frontmatter fields read:
-//   - paths | globs | applyTo  → file-match globs (merged)
-//   - alwaysApply              → always inject regardless of cwd/files
-//   - description              → metadata for /claude-rules listing
+// The xd://claude_rules device stays as an on-demand index/reader for
+// anything the auto-match misses.
 //
-// Injection philosophy (pi-rules style dynamic injection — models don't
-// reliably read xd:// devices on demand; omp itself keeps web_search etc.
-// top-level for exactly this reason, issue #5973):
-//   - alwaysApply rules → full content injected into the system prompt each
-//     agent loop (unconditional rules, like omp's sticky RULES.md).
-//   - Path-scoped rules + subdirectory CLAUDE.md → injected dynamically: on
-//     every read/edit/write tool_result we extract the target file path,
-//     match it against rule globs / directory scopes, and append matching
-//     rule bodies to that tool's result. The rule arrives exactly when the
-//     model touches a matching file — zero model initiative required.
-//     (Same mechanism as the pi-rules extension: tool_result event.)
-//   - The xd://claude_rules device stays as an on-demand index/reader for
-//     anything the auto-match misses.
-//
-// Token cap: 12 KB for the alwaysApply block (aligned with pi-rules).
+// Token cap: 12 KB per injected block (aligned with pi-rules).
 // Only dependency: picomatch vendored at vendor/picomatch (glob matching,
 // same options as pi-rules). Vendored because marketplace installs don't run
 // dependency installation; picomatch is zero-dep pure JS.
 // Frontmatter stays hand-rolled to avoid a yaml dependency.
 
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -108,13 +111,17 @@ export interface ExtensionApi {
 // for tests (vitest, see test/)
 export let rules: Rule[] = [];
 
-/** Subdirectory CLAUDE.md files (not in .claude/rules/), indexed by their directory scope. */
+/** A discovered CLAUDE.md file. `name` is the directory it governs (absolute). */
 export interface SubClaudeMd {
-	name: string; // directory relative to cwd, e.g. "packages/api"
+	name: string; // absolute directory path owning this CLAUDE.md
 	filePath: string;
 	body: string;
 }
-export let subClaudeMds: SubClaudeMd[] = [];
+
+/** CLAUDE.md from cwd up to $HOME — injected into the system prompt once. */
+export let hierClaudeMds: SubClaudeMd[] = [];
+/** filePaths already in the system-prompt layer; dynamic injection skips them. */
+export let systemPromptMdPaths: Set<string> = new Set();
 
 const HOME = homedir();
 
@@ -184,7 +191,7 @@ async function scanRulesDir(dir: string, out: Rule[], seen: Set<string>): Promis
 	let entries: string[];
 	try { entries = await readdir(dir); } catch { return; }
 	for (const name of entries) {
-		if (!name.endsWith(".md") && !name.endsWith(".mdc")) continue;
+		if (!/\.(md|mdc)$/.test(name)) continue;
 		const fp = join(dir, name);
 		if (seen.has(fp)) continue;
 		seen.add(fp);
@@ -208,36 +215,34 @@ export async function discoverRules(cwd: string): Promise<Rule[]> {
 	return out;
 }
 
-/** Recurse cwd subdirectories (check dirs ≤ 3 levels deep, skipping hidden/build dirs) for CLAUDE.md files. */
-export async function scanSubdirClaudeMds(cwd: string, out: SubClaudeMd[], depth = 0): Promise<void> {
-	if (depth >= 3) return;
-	let entries: string[];
-	try { entries = await readdir(cwd); } catch { return; }
-	for (const name of entries) {
-		if (name.startsWith(".")) continue; // .git, node_modules (hidden), .claude itself
-		if (SKIP_DIRS.has(name)) continue;
-		const fp = join(cwd, name);
-		let st;
-		try { st = await stat(fp); } catch { continue; }
-		if (!st.isDirectory()) continue;
-		for (const candidate of [join(fp, "CLAUDE.md"), join(fp, ".claude", "CLAUDE.md")]) {
-			try {
-				const raw = await readFile(candidate, "utf8");
-				if (!raw.trim()) continue;
-				out.push({
-					name: fp,
-					filePath: candidate,
-					body: raw.length > MAX_RULE_BYTES ? raw.slice(0, MAX_RULE_BYTES) + "\n\n[...truncated]" : raw,
-				});
-			} catch {
-				// no CLAUDE.md at this candidate
-			}
+/**
+ * Walk `startDir` up to $HOME, returning the first CLAUDE.md found at each
+ * level (checking `CLAUDE.md` then `.claude/CLAUDE.md`; first hit per directory
+ * wins to avoid double-loading two variants of the same dir's memory).
+ * Ordered deepest-first.
+ */
+export async function findClaudeMdsUpward(startDir: string): Promise<SubClaudeMd[]> {
+	const out: SubClaudeMd[] = [];
+	let dir = resolve(startDir);
+	for (;;) {
+		for (const candidate of [join(dir, "CLAUDE.md"), join(dir, ".claude", "CLAUDE.md")]) {
+			let raw: string;
+			try { raw = await readFile(candidate, "utf8"); } catch { continue; }
+			if (!raw.trim()) continue;
+			out.push({
+				name: dir,
+				filePath: candidate,
+				body: raw.length > MAX_RULE_BYTES ? raw.slice(0, MAX_RULE_BYTES) + "\n\n[...truncated]" : raw,
+			});
+			break; // first hit per directory
 		}
-		await scanSubdirClaudeMds(fp, out, depth + 1);
+		if (dir === HOME) break;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
 	}
+	return out;
 }
-
-const SKIP_DIRS = new Set(["node_modules", "dist", "build", ".next", ".nuxt", "coverage", "target", "out"]);
 
 async function probeDirs(cwd: string): Promise<{ scanned: string[]; home: string }> {
 	const scanned: string[] = [];
@@ -250,11 +255,6 @@ async function probeDirs(cwd: string): Promise<{ scanned: string[]; home: string
 	}
 	scanned.push(join(HOME, ".claude", "rules"));
 	return { scanned, home: HOME };
-}
-
-function selectRules(): Rule[] {
-	// only unconditional rules get injected; path-scoped ones are indexed instead
-	return rules.filter(r => r.alwaysApply);
 }
 
 function buildBlock(matched: Rule[]): string {
@@ -278,7 +278,40 @@ function buildBlock(matched: Rule[]): string {
 	].join("\n");
 }
 
-/** Path-scoped rules index text (name + globs + file path), served by the xd:// tool. */
+/** System-prompt block for the cwd→home CLAUDE.md hierarchy. */
+function buildClaudeMdBlock(mds: SubClaudeMd[]): string {
+	if (mds.length === 0) return "";
+	const blocks: string[] = [];
+	let used = 0;
+	for (const m of mds) {
+		const head = `<!-- claude-md: ${m.filePath} -->`;
+		const piece = `${head}\n${m.body}`;
+		if (used + piece.length > MAX_BYTES) break;
+		blocks.push(piece);
+		used += piece.length;
+	}
+	if (blocks.length === 0) return "";
+	return [
+		"## Project CLAUDE.md (cwd → home hierarchy)",
+		"",
+		"Claude Code CLAUDE.md files from the session cwd up to $HOME — in effect for the whole session. " +
+			"Subdirectory CLAUDE.md deeper than cwd (or outside the cwd→home chain) is injected dynamically " +
+			"when a file under it is read/edited.",
+		"",
+		blocks.join("\n\n---\n\n"),
+	].join("\n");
+}
+
+/** CLAUDE.md files injected into tool results this session (dynamic layer), derived from the per-target dedupe keys. */
+function injectedSubclaudePaths(): string[] {
+	const ruleFilePaths = new Set(rules.map(r => r.filePath));
+	const out = new Set<string>();
+	for (const key of injectedKeys) {
+		const fp = key.split("\0")[0];
+		if (!ruleFilePaths.has(fp)) out.add(fp);
+	}
+	return [...out];
+}
 function buildIndexText(): string {
 	const scoped = rules.filter(r => !r.alwaysApply && r.globs.length > 0);
 	const lines: string[] = [];
@@ -286,25 +319,35 @@ function buildIndexText(): string {
 		lines.push("## Project Rules Index (.claude/rules/)");
 		lines.push(...scoped.map(r => `- ${r.name} — ${r.globs.join(", ")} — ${r.filePath}`));
 	}
-	if (subClaudeMds.length > 0) {
+	if (hierClaudeMds.length > 0) {
 		if (lines.length > 0) lines.push("");
-		lines.push("## Subdirectory CLAUDE.md");
-		lines.push("Applies to files under its directory. Read before editing there:");
-		lines.push(...subClaudeMds.map(m => `- ${m.name} — ${m.filePath}`));
+		lines.push("## CLAUDE.md (cwd → home, in system prompt)");
+		lines.push(...hierClaudeMds.map(m => `- ${m.name} — ${m.filePath}`));
 	}
-	if (lines.length === 0) return "No path-scoped rules or subdirectory CLAUDE.md files loaded.";
+	const dynInjected = injectedSubclaudePaths();
+	if (dynInjected.length > 0) {
+		if (lines.length > 0) lines.push("");
+		lines.push("## CLAUDE.md (dynamically injected into tool results this session)");
+		lines.push(...dynInjected.map(fp => `- ${fp}`));
+	} else {
+		lines.push("");
+		lines.push("Subdirectory CLAUDE.md (deeper than cwd, or outside the cwd→home chain) is injected dynamically on read/edit/write — no static index; discovered by walking up from the touched file.");
+	}
 	return lines.join("\n");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Dynamic injection (pi-rules style): path-scoped rules and subdirectory
-// CLAUDE.md files are appended to the result of any read/edit/write tool
-// call whose target file matches. Rule content arrives exactly when the
-// model touches a matching file — no model initiative required.
+// Dynamic injection (pi-rules style): path-scoped rules and CLAUDE.md files
+// are appended to the result of any read/edit/write tool call whose target
+// file matches. Content arrives exactly when the model touches a matching
+// file — no model initiative required.
 // ───────────────────────────────────────────────────────────────────────────
 
 /** Per-session dedupe key: `${ruleFilePath}\0${absTargetPath}`. Reset on reload. */
 export const injectedKeys = new Set<string>();
+
+/** CLAUDE.md files toasted as "injected" this session; per-filePath dedupe so reading many files under one CLAUDE.md toasts once. */
+export let notifiedInjectedMds: Set<string> = new Set();
 
 const TRACKED_TOOLS: Record<string, true> = { read: true, edit: true, write: true };
 
@@ -362,8 +405,14 @@ interface MatchedRule {
 	kind: "rule" | "subclaude";
 }
 
-/** Rules whose globs / directory scope match the absolute target path. */
-export function matchForPath(absPath: string, cwd: string): MatchedRule[] {
+/**
+ * Matching rules + CLAUDE.md for an absolute target path.
+ * - Path-scoped .claude/rules globs are matched against the cwd-relative path.
+ * - CLAUDE.md is found by walking UP from the target file's directory to
+ *   $HOME; any CLAUDE.md already in the system-prompt layer is skipped (it's
+ *   already in effect, no need to repeat per file touch).
+ */
+export async function matchForPath(absPath: string, cwd: string): Promise<MatchedRule[]> {
 	const rel = relative(cwd, absPath).split(sep).join("/");
 	const base = basename(absPath);
 	const out: MatchedRule[] = [];
@@ -371,10 +420,10 @@ export function matchForPath(absPath: string, cwd: string): MatchedRule[] {
 		if (r.alwaysApply || r.globs.length === 0) continue; // alwaysApply already in the system prompt
 		if (matchesGlobs(r.globs, rel, base)) out.push({ filePath: r.filePath, body: r.body, kind: "rule" });
 	}
-	for (const m of subClaudeMds) {
-		if (absPath === m.name || absPath.startsWith(m.name + sep)) {
-			out.push({ filePath: m.filePath, body: m.body, kind: "subclaude" });
-		}
+	const upward = await findClaudeMdsUpward(dirname(absPath));
+	for (const m of upward) {
+		if (systemPromptMdPaths.has(m.filePath)) continue;
+		out.push({ filePath: m.filePath, body: m.body, kind: "subclaude" });
 	}
 	return out;
 }
@@ -430,16 +479,17 @@ export async function handleToolResult(
 		isError: boolean;
 		details?: unknown;
 	},
-	cwd: string,
+	ctx: ExtensionContext,
 ): Promise<{ content: Array<{ type: string; text?: string }> } | undefined> {
 	if (event.isError) return undefined;
+	const cwd = ctx.cwd;
 	const targets = extractTargetPaths(event, cwd);
 	if (targets.length === 0) return undefined;
 	const matched: MatchedRule[] = [];
 	const keys: string[] = [];
 	const seenRules = new Set<string>(); // one event, one injection per rule file (pi-rules seenRules)
 	for (const t of targets) {
-		for (const m of matchForPath(t, cwd)) {
+		for (const m of await matchForPath(t, cwd)) {
 			if (seenRules.has(m.filePath)) continue;
 			seenRules.add(m.filePath);
 			const key = `${m.filePath}\0${t}`;
@@ -447,6 +497,11 @@ export async function handleToolResult(
 			injectedKeys.add(key);
 			matched.push(m);
 			keys.push(key);
+			// ponytail: toast once per CLAUDE.md when it's dynamically injected for the first time
+			if (m.kind === "subclaude" && !notifiedInjectedMds.has(m.filePath)) {
+				notifiedInjectedMds.add(m.filePath);
+				ctx.ui.notify(`[claude-rules] injected: ${m.filePath}`, "info");
+			}
 		}
 	}
 	if (matched.length === 0) return undefined;
@@ -461,37 +516,41 @@ export async function handleToolResult(
 let lastError: string | undefined;
 
 export default function claudeRulesBridge(pi: ExtensionApi): void {
-	const reload = async (cwd: string, ui?: ExtensionContext["ui"]): Promise<void> => {
+	let notifiedCwd: string | undefined; // toast once per cwd per session (mirrors memory's per-path dedupe)
+
+	const reload = async (ctx: ExtensionContext): Promise<void> => {
 		try {
-			rules = await discoverRules(cwd);
-			const sub: SubClaudeMd[] = [];
-			await scanSubdirClaudeMds(cwd, sub);
-			subClaudeMds = sub;
+			rules = await discoverRules(ctx.cwd);
+			hierClaudeMds = await findClaudeMdsUpward(ctx.cwd);
+			systemPromptMdPaths = new Set(hierClaudeMds.map(m => m.filePath));
 			injectedKeys.clear();
+			notifiedInjectedMds = new Set();
 			lastError = undefined;
-			if (ui && (rules.length > 0 || subClaudeMds.length > 0)) {
-				ui.notify(`[claude-rules] ${rules.length} rules, ${subClaudeMds.length} subdir CLAUDE.md`, "info");
+			if (ctx.cwd !== notifiedCwd) {
+				notifiedCwd = ctx.cwd;
+				ctx.ui.notify(`[claude-rules] loaded: ${rules.length} rules, ${hierClaudeMds.length} CLAUDE.md`, "info");
 			}
 		} catch (e) {
 			rules = [];
-			subClaudeMds = [];
+			hierClaudeMds = [];
+			systemPromptMdPaths = new Set();
 			lastError = (e as Error).message ?? String(e);
-			ui?.notify(`[claude-rules] load failed: ${lastError}`, "error");
+			ctx.ui.notify(`Claude rules load failed: ${lastError}`, "warning");
 		}
 	};
 
-	pi.on("session_start", async (_e, ctx) => { await reload(ctx.cwd, ctx.ui); });
+	pi.on("session_start", async (_e, ctx) => { await reload(ctx); });
 	for (const evt of ["session_switch", "session_branch", "session_tree", "session_compact"] as const) {
-		pi.on(evt, async (_e, ctx) => { await reload(ctx.cwd, ctx.ui); });
+		pi.on(evt, async (_e, ctx) => { await reload(ctx); });
 	}
 
 	pi.registerTool({
 		name: "claude_rules",
 		label: "Claude Rules",
 		description:
-			"List path-scoped .claude/rules rules and subdirectory CLAUDE.md files (no args), " +
-			"or read one rule's full content (args: name). Matching rules are auto-injected " +
-			"into read/edit/write tool results.",
+			"List path-scoped .claude/rules rules and cwd→home CLAUDE.md files (no args), " +
+			"or read one rule's full content (args: name). Matching rules and subdirectory " +
+			"CLAUDE.md are auto-injected into read/edit/write tool results.",
 		parameters: pi.zod.object({ name: pi.zod.string().optional() }),
 		async execute(_toolCallId, params) {
 			const name = params?.name?.trim();
@@ -502,48 +561,63 @@ export default function claudeRulesBridge(pi: ExtensionApi): void {
 			if (rule) {
 				return { content: [{ type: "text", text: `<!-- claude-rules: ${rule.filePath} -->\n${rule.body}` }] };
 			}
-			const sub = subClaudeMds.find(m => m.name === name);
+			const sub = hierClaudeMds.find(m => m.name === name || m.filePath === name);
 			if (sub) {
 				return { content: [{ type: "text", text: `<!-- claude-md: ${sub.filePath} -->\n${sub.body}` }] };
 			}
-			const available = [...rules.map(r => r.name), ...subClaudeMds.map(m => m.name)].join(", ") || "none";
-			return { content: [{ type: "text", text: `Unknown rule: ${name}\nAvailable: ${available}` }] };
+			const available = [...rules.map(r => r.name), ...hierClaudeMds.map(m => m.name)].join(", ") || "none";
+			return { content: [{ type: "text", text: `Unknown rule: ${name}\nAvailable: ${available}\n(Subdirectory CLAUDE.md outside the cwd→home chain is injected dynamically, not indexed — read a file under it.)` }] };
 		},
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		if (rules.length === 0) return;
-		const always = buildBlock(selectRules());
-		if (!always) return;
-		return { systemPrompt: [...event.systemPrompt, always] };
+		const parts: string[] = [];
+		// only unconditional rules get injected; path-scoped ones are matched dynamically
+		const always = buildBlock(rules.filter(r => r.alwaysApply));
+		if (always) parts.push(always);
+		const mdBlock = buildClaudeMdBlock(hierClaudeMds);
+		if (mdBlock) parts.push(mdBlock);
+		if (parts.length === 0) return;
+		return { systemPrompt: [...event.systemPrompt, ...parts] };
 	});
 
-	pi.on("tool_result", (event, ctx) => handleToolResult(event, ctx.cwd));
+	pi.on("tool_result", (event, ctx) => handleToolResult(event, ctx));
 
 	pi.registerCommand("claude-rules", {
-		description: "List .claude/rules/ files. Subcommand: reload",
+		description: "List .claude/rules/ files and CLAUDE.md. Subcommand: reload",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim();
 			if (sub === "reload") {
-				await reload(ctx.cwd, ctx.ui);
+				await reload(ctx);
 				return;
 			}
-			if (rules.length === 0) {
-				const probe = await probeDirs(ctx.cwd);
-				ctx.ui.notify(`[claude-rules] no rules loaded\ncwd: ${ctx.cwd}\nscanned: ${probe.scanned.join(", ") || "(none)"}\nhome: ${probe.home}\n${lastError ? `error: ${lastError}` : "no .claude/rules/ in cwd walk-up or ~/.claude/rules/"}`, "info");
-				return;
-			}
-			const lines = [
-				...rules.map(r => {
-					const flags = [
-						r.alwaysApply ? "alwaysApply" : null,
-						r.globs.length ? `globs=[${r.globs.join(",")}]` : null,
-					].filter(Boolean).join(" ");
-					return `- ${r.name}  ${flags}\n  ${r.filePath}`;
-				}),
-				...subClaudeMds.map(m => `- ${m.name} (CLAUDE.md)\n  ${m.filePath}`),
-			];
-			ctx.ui.notify(`[claude-rules] ${rules.length} rules, ${subClaudeMds.length} subdir CLAUDE.md:\n${lines.join("\n")}`, "info");
+		if (rules.length === 0 && hierClaudeMds.length === 0) {
+			const probe = await probeDirs(ctx.cwd);
+			ctx.ui.notify(
+				`Claude rules: none • cwd ${ctx.cwd}\n` +
+				`scanned: ${probe.scanned.join(", ") || "(none)"}\n` +
+				`home: ${probe.home}\n` +
+				(lastError ? `error: ${lastError}` : "no .claude/rules/ in cwd walk-up or ~/.claude/rules/, and no CLAUDE.md from cwd→home"),
+				"info",
+			);
+			return;
+		}
+		const lines = [
+			...rules.map(r => {
+				const flags = [
+					r.alwaysApply ? "alwaysApply" : null,
+					r.globs.length ? `globs=[${r.globs.join(",")}]` : null,
+				].filter(Boolean).join(" ");
+				return `- ${r.name}  ${flags}\n  ${r.filePath}`;
+			}),
+			...hierClaudeMds.map(m => `- ${m.name} (CLAUDE.md, system-prompt)\n  ${m.filePath}`),
+			...injectedSubclaudePaths().map(fp => `- ${fp} (CLAUDE.md, dynamically injected)\n  ${fp}`),
+		];
+		ctx.ui.notify(
+			`Claude rules: ${rules.length} rules • ${hierClaudeMds.length} CLAUDE.md (system-prompt) • ${injectedSubclaudePaths().length} injected\n` +
+			lines.join("\n"),
+			"info",
+		);
 		},
 	});
 }

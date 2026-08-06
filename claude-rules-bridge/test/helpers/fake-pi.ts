@@ -5,7 +5,7 @@
 //     (a handler's return value becomes the next handler's event input,
 //     mirroring the omp runner's merge semantics)
 //   - makeCtx() builds a stub ExtensionContext; ui.notify records into the
-//     harness
+//     harness, ui.setStatus records into a Map (last-write-wins per name)
 
 import type { ExtensionApi, ExtensionContext } from "../../index";
 
@@ -28,12 +28,19 @@ export interface CapturedNotification {
 	level: string;
 }
 
+export interface CapturedStatus {
+	name: string;
+	text: string;
+}
+
 export interface FakePiHarness {
 	pi: ExtensionApi;
 	handlers: CapturedHandler[];
 	tools: CapturedTool[];
 	commands: CapturedCommand[];
 	notifications: CapturedNotification[];
+	/** Last text pushed to each named status line. */
+	status: Map<string, string>;
 	/** Dispatch an event to all registered handlers (Promise-aware, chained). */
 	emit(eventName: string, event: unknown, ctx: ExtensionContext): Promise<unknown>;
 	/** Build a stub ExtensionContext; ui methods record into the harness. */
@@ -45,6 +52,7 @@ export function createFakePi(): FakePiHarness {
 	const tools: CapturedTool[] = [];
 	const commands: CapturedCommand[] = [];
 	const notifications: CapturedNotification[] = [];
+	const status = new Map<string, string>();
 
 	const on = ((event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown) => {
 		handlers.push({ event, handler });
@@ -71,6 +79,7 @@ export function createFakePi(): FakePiHarness {
 		tools,
 		commands,
 		notifications,
+		status,
 		async emit(eventName, event, ctx) {
 			let current = event;
 			for (const h of handlers) {
@@ -86,6 +95,10 @@ export function createFakePi(): FakePiHarness {
 				ui: {
 					notify: (message: string, level: string) => {
 						notifications.push({ message, level });
+					},
+					setStatus: (name: string, text: string) => {
+						if (text === "") status.delete(name);
+						else status.set(name, text);
 					},
 				},
 				...overrides,

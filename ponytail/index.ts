@@ -44,7 +44,7 @@ interface PonytailSessionEntry {
 }
 
 interface PiUI {
-  setStatus?: (name: string, text: string) => void
+  setStatus?: (name: string, text: string | undefined) => void
   setEditorText?: (text: string) => void
   theme?: {
     fg?: (color: string, text: string) => string
@@ -219,7 +219,7 @@ export default function ponytailExtension(pi: PiHost) {
     if (!setStatus) return
     const raw = renderStatus(currentMode)
     if (!raw) {
-      setStatus('ponytail', '')
+      setStatus('ponytail', undefined)
       return
     }
     const theme = target?.ui?.theme
@@ -299,16 +299,13 @@ export default function ponytailExtension(pi: PiHost) {
   }
 
   pi.on('session_start', (_rawEvent, rawCtx) => {
+    // adoptSession() already pushes the mode to the status line; no popup.
     adoptSession(rawCtx)
-    const ctx = rawCtx as PiContext | undefined
-    ctx?.ui?.notify?.(`Ponytail loaded: ${currentMode}`, 'info')
   })
 
   for (const evt of ['session_switch', 'session_branch', 'session_tree']) {
     pi.on(evt, (_rawEvent, rawCtx) => {
       adoptSession(rawCtx)
-      const ctx = rawCtx as PiContext | undefined
-      ctx?.ui?.notify?.(`Ponytail mode: ${currentMode}`, 'info')
     })
   }
 
