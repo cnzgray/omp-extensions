@@ -4,9 +4,16 @@
     "name": "cnzgray"
   },
   "metadata": {
-    "description": "Oh My Pi extensions by cnzgray: claude-auto-memory, claude-rules-bridge"
+    "description": "Oh My Pi extensions by cnzgray: ponytail, claude-auto-memory, claude-rules-bridge"
   },
   "plugins": [
+    {
+      "name": "ponytail",
+      "source": "./ponytail",
+      "description": "Lazy senior dev mode: forces the laziest solution that actually works",
+      "author": { "name": "cnzgray" },
+      "license": "MIT"
+    },
     {
       "name": "claude-auto-memory",
       "source": "./claude-auto-memory",

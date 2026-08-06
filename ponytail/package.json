@@ -1,0 +1,12 @@
+{
+  "name": "ponytail",
+  "version": "1.0.0",
+  "description": "Lazy senior dev mode: forces the laziest solution that actually works",
+  "license": "MIT",
+  "type": "module",
+  "omp": {
+    "name": "Ponytail",
+    "description": "Lazy senior dev mode",
+    "extensions": ["./index.ts"]
+  }
+}
