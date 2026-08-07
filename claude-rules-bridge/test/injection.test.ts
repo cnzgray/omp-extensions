@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import claudeRulesBridge, {
@@ -49,6 +49,13 @@ describe("discovery", () => {
 		expect(hierClaudeMds[0].name).toBe(tmp);
 		expect(hierClaudeMds[0].filePath).toBe(join(tmp, "CLAUDE.md"));
 	});
+
+	it("loads CLAUDE.local.md appended after CLAUDE.md at the same level", async () => {
+		writeFileSync(join(tmp, "CLAUDE.local.md"), "Personal notes.\n");
+		const mds = await findClaudeMdsUpward(tmp);
+		const atRoot = mds.filter(m => m.name === tmp);
+		expect(atRoot.map(m => m.filePath)).toEqual([join(tmp, "CLAUDE.md"), join(tmp, "CLAUDE.local.md")]);
+	});
 });
 
 describe("matchForPath", () => {
@@ -68,6 +75,24 @@ describe("matchForPath", () => {
 		// systemPromptMdPaths → skipped → empty.
 		expect(await matchForPath(join(tmp, "README.md"), tmp)).toHaveLength(0);
 		expect(systemPromptMdPaths.has(join(tmp, "CLAUDE.md"))).toBe(true);
+	});
+
+	it("injects nothing for files outside cwd (official: nothing outside the working tree)", async () => {
+		const sibling = mkdtempSync(join(dirname(tmp), "claude-rules-sibling-"));
+		try {
+			writeFileSync(join(sibling, "CLAUDE.md"), "Sibling memory.\n");
+			const hit = await matchForPath(join(sibling, "index.ts"), tmp);
+			expect(hit).toHaveLength(0); // no rules (basename glob), no CLAUDE.md
+		} finally {
+			rmSync(sibling, { recursive: true, force: true });
+		}
+	});
+
+	it("injects a subdir CLAUDE.local.md dynamically", async () => {
+		writeFileSync(join(apiDir, "CLAUDE.local.md"), "API local notes.\n");
+		const hit = await matchForPath(join(apiDir, "index.ts"), tmp);
+		const subs = hit.filter(m => m.kind === "subclaude").map(m => m.filePath);
+		expect(subs).toEqual([join(apiDir, "CLAUDE.md"), join(apiDir, "CLAUDE.local.md")]);
 	});
 });
 

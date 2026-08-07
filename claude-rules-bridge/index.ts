@@ -12,18 +12,21 @@
 //      when the touched file matches the globs.
 //
 // 2. CLAUDE.md files (Claude Code hierarchical memory)
-//    Mirrors Claude Code semantics:
+//    Mirrors Claude Code semantics (code.claude.com/docs/en/memory):
 //    - System-prompt layer: at session start, every CLAUDE.md (and
-//      .claude/CLAUDE.md) from the session cwd up to $HOME is collected and
-//      injected once into the system prompt — the cwd's own CLAUDE.md lives
-//      here, so it is in effect from the first agent turn, not on first file
-//      touch.
-//    - Dynamic layer: on every read/edit/write tool_result we walk UP from the
-//      touched file's directory to $HOME and inject any CLAUDE.md not already
-//      in the system-prompt layer. This covers CLAUDE.md deeper than cwd
-//      (subdirectory memory) AND CLAUDE.md outside the cwd→home chain
-//      (worktrees, sibling monorepo packages) — the old "recurse cwd down 3
-//      levels" scan could do neither.
+//      .claude/CLAUDE.md, plus CLAUDE.local.md appended after it per level)
+//      from the session cwd up to $HOME is collected and injected once into
+//      the system prompt — the cwd's own CLAUDE.md lives here, so it is in
+//      effect from the first agent turn, not on first file touch.
+//    - Dynamic layer: on every read/edit/write tool_result of a file under
+//      cwd we walk UP from the touched file's directory to $HOME and inject
+//      any CLAUDE.md not already in the system-prompt layer (systemPromptMdPaths
+//      filters the cwd→home chain) — subdirectory memory loads exactly when a
+//      file under it is touched. Files outside cwd get no dynamic rules or
+//      CLAUDE.md: official Claude Code only loads subdirectory memory under
+//      the working directory, and extra directories require --add-dir +
+//      CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1 (omp has no add-dir
+//      concept, so that opt-in has no equivalent here).
 //
 // Why before_agent_start (not before_provider_request):
 //   OMP's extensions runner consumes the systemPrompt return value and
@@ -215,27 +218,33 @@ export async function discoverRules(cwd: string): Promise<Rule[]> {
 	return out;
 }
 
+async function readClaudeMd(filePath: string, dir: string): Promise<SubClaudeMd | null> {
+	let raw: string;
+	try { raw = await readFile(filePath, "utf8"); } catch { return null; }
+	if (!raw.trim()) return null;
+	return {
+		name: dir,
+		filePath,
+		body: raw.length > MAX_RULE_BYTES ? raw.slice(0, MAX_RULE_BYTES) + "\n\n[...truncated]" : raw,
+	};
+}
+
 /**
- * Walk `startDir` up to $HOME, returning the first CLAUDE.md found at each
- * level (checking `CLAUDE.md` then `.claude/CLAUDE.md`; first hit per directory
- * wins to avoid double-loading two variants of the same dir's memory).
- * Ordered deepest-first.
+ * Walk `startDir` up to $HOME, collecting per level the first of
+ * `CLAUDE.md` / `.claude/CLAUDE.md`, then `CLAUDE.local.md` appended after it
+ * (official load order: personal notes last). Ordered deepest-first. The
+ * dynamic layer relies on systemPromptMdPaths to skip the cwd→home layer.
  */
 export async function findClaudeMdsUpward(startDir: string): Promise<SubClaudeMd[]> {
 	const out: SubClaudeMd[] = [];
 	let dir = resolve(startDir);
 	for (;;) {
 		for (const candidate of [join(dir, "CLAUDE.md"), join(dir, ".claude", "CLAUDE.md")]) {
-			let raw: string;
-			try { raw = await readFile(candidate, "utf8"); } catch { continue; }
-			if (!raw.trim()) continue;
-			out.push({
-				name: dir,
-				filePath: candidate,
-				body: raw.length > MAX_RULE_BYTES ? raw.slice(0, MAX_RULE_BYTES) + "\n\n[...truncated]" : raw,
-			});
-			break; // first hit per directory
+			const m = await readClaudeMd(candidate, dir);
+			if (m) { out.push(m); break; } // first hit per directory
 		}
+		const local = await readClaudeMd(join(dir, "CLAUDE.local.md"), dir);
+		if (local) out.push(local);
 		if (dir === HOME) break;
 		const parent = dirname(dir);
 		if (parent === dir) break;
@@ -295,7 +304,7 @@ function buildClaudeMdBlock(mds: SubClaudeMd[]): string {
 		"## Project CLAUDE.md (cwd → home hierarchy)",
 		"",
 		"Claude Code CLAUDE.md files from the session cwd up to $HOME — in effect for the whole session. " +
-			"Subdirectory CLAUDE.md deeper than cwd (or outside the cwd→home chain) is injected dynamically " +
+			"Subdirectory CLAUDE.md/CLAUDE.local.md deeper than cwd is injected dynamically " +
 			"when a file under it is read/edited.",
 		"",
 		blocks.join("\n\n---\n\n"),
@@ -331,7 +340,7 @@ function buildIndexText(): string {
 		lines.push(...dynInjected.map(fp => `- ${fp}`));
 	} else {
 		lines.push("");
-		lines.push("Subdirectory CLAUDE.md (deeper than cwd, or outside the cwd→home chain) is injected dynamically on read/edit/write — no static index; discovered by walking up from the touched file.");
+		lines.push("Subdirectory CLAUDE.md/CLAUDE.local.md (deeper than cwd) is injected dynamically on read/edit/write — no static index; discovered by walking up from the touched file (files outside cwd get none).");
 	}
 	return lines.join("\n");
 }
@@ -406,15 +415,20 @@ interface MatchedRule {
 }
 
 /**
- * Matching rules + CLAUDE.md for an absolute target path.
+ * Matching rules + CLAUDE.md for an absolute target path. Files outside cwd
+ * get neither (returns []).
  * - Path-scoped .claude/rules globs are matched against the cwd-relative path.
  * - CLAUDE.md is found by walking UP from the target file's directory to
- *   $HOME; any CLAUDE.md already in the system-prompt layer is skipped (it's
- *   already in effect, no need to repeat per file touch).
+ *   $HOME; the cwd→home layer is already in the system prompt and skipped via
+ *   systemPromptMdPaths. Only files under cwd get dynamic subdirectory memory —
+ *   official Claude Code loads nothing outside the working directory tree.
+ *   CLAUDE.md already in the system-prompt layer is skipped (it's already in
+ *   effect, no need to repeat per file touch).
  */
 export async function matchForPath(absPath: string, cwd: string): Promise<MatchedRule[]> {
 	const rel = relative(cwd, absPath).split(sep).join("/");
 	const base = basename(absPath);
+	if (rel.startsWith("..")) return []; // outside cwd: no project rules, no dynamic CLAUDE.md (official)
 	const out: MatchedRule[] = [];
 	for (const r of rules) {
 		if (r.alwaysApply || r.globs.length === 0) continue; // alwaysApply already in the system prompt
@@ -566,7 +580,7 @@ export default function claudeRulesBridge(pi: ExtensionApi): void {
 				return { content: [{ type: "text", text: `<!-- claude-md: ${sub.filePath} -->\n${sub.body}` }] };
 			}
 			const available = [...rules.map(r => r.name), ...hierClaudeMds.map(m => m.name)].join(", ") || "none";
-			return { content: [{ type: "text", text: `Unknown rule: ${name}\nAvailable: ${available}\n(Subdirectory CLAUDE.md outside the cwd→home chain is injected dynamically, not indexed — read a file under it.)` }] };
+			return { content: [{ type: "text", text: `Unknown rule: ${name}\nAvailable: ${available}\n(Subdirectory CLAUDE.md deeper than cwd is injected dynamically, not indexed — read a file under it.)` }] };
 		},
 	});
 
