@@ -31,6 +31,7 @@ interface PonytailConfig {
   normalizePersistedMode: (m: unknown) => PonytailMode | null
   isDeactivationCommand: (text: string) => boolean
   writeDefaultMode: (m: string) => PonytailMode | null
+  getHideStatus?: () => boolean
 }
 
 interface PonytailInstructions {
@@ -48,8 +49,6 @@ interface PiUI {
   setEditorText?: (text: string) => void
   theme?: {
     fg?: (color: string, text: string) => string
-    bg?: (color: string, text: string) => string
-    icon?: { auto?: string; fast?: string; search?: string }
   }
   notify?: (message: string, level: string) => void
 }
@@ -126,6 +125,7 @@ const configModule: PonytailConfig = ponytailRoot
       normalizePersistedMode: () => null,
       isDeactivationCommand: () => false,
       writeDefaultMode: () => null,
+      getHideStatus: () => false,
     }
 
 const instructionsModule: PonytailInstructions = ponytailRoot
@@ -137,6 +137,9 @@ const instructionsModule: PonytailInstructions = ponytailRoot
 
 const { DEFAULT_MODE, getDefaultMode, normalizeMode, normalizeConfigMode,
         normalizePersistedMode, isDeactivationCommand, writeDefaultMode } = configModule
+// ponytail: getHideStatus landed after the 4.8.4-era hooks snapshots; stale
+// installs degrade to "always show", same as upstream before #324.
+const getHideStatus = configModule.getHideStatus ?? (() => false)
 const { getPonytailInstructions } = instructionsModule
 
 
@@ -178,21 +181,10 @@ function parsePonytailCommand(text: string, defaultMode: PonytailMode): CommandP
     : { type: 'invalid', reason: 'invalid-mode', mode: primary }
 }
 
-// ponytail: labels + OMP theme icons (auto/fast/search) — monospace-safe,
-// follow the active symbol preset (unicode/nerd/ascii). Claude Code's hooks
-// use plant/bolt/fire glyphs; OMP has no equivalents, so we map by intent.
-const MODE_META: Record<PonytailMode, { label: string; icon: 'auto' | 'fast' | 'search' }> = {
-  lite: { label: 'LITE', icon: 'auto' },
-  full: { label: 'FULL', icon: 'auto' },
-  ultra: { label: 'ULTRA', icon: 'fast' },
-  off: { label: 'OFF', icon: 'auto' },
-  review: { label: 'REVIEW', icon: 'search' },
-}
-
-function renderStatus(mode: PonytailMode): string {
-  if (mode === 'off') return ''
-  return `ponytail:${MODE_META[mode].label}`
-}
+// ponytail: level icons mirror the upstream pi-extension status bar
+// (🌿/⚡/🔥); OMP's theme exposes the same color roles (accent/dim/muted/text),
+// so the rendered string is byte-identical with Claude Code's.
+const LEVEL_ICONS: Record<string, string> = { lite: '🌿', full: '⚡', ultra: '🔥' }
 
 interface PiCommandDef {
   description: string
@@ -209,28 +201,36 @@ interface PiHost {
 export default function ponytailExtension(pi: PiHost) {
   let currentMode: PonytailMode = DEFAULT_MODE
   let configuredDefaultMode: PonytailMode = getDefaultMode()
+  let hideStatus = getHideStatus()
   let isActive = false
   let lastCtx: PiContext | null = null
 
   function syncStatus(ctx: PiContext | null) {
     if (ctx) lastCtx = ctx
-    const target = ctx || lastCtx
-    const setStatus = target?.ui?.setStatus
+    const c = ctx || lastCtx
+    // ponytail: hide the indicator but keep the ruleset active (#324).
+    if (hideStatus) return
+    const setStatus = c?.ui?.setStatus
     if (!setStatus) return
-    const raw = renderStatus(currentMode)
-    if (!raw) {
-      setStatus('ponytail', undefined)
+    // ponytail: try/catch guards against a theme proxy throwing before initTheme.
+    let theme: PiUI['theme']
+    try {
+      theme = c.ui?.theme
+      if (!theme?.fg) return
+    } catch {
       return
     }
-    const theme = target?.ui?.theme
-    if (!theme?.fg) {
-      setStatus('ponytail', raw)
+    if (currentMode === 'off') {
+      setStatus('ponytail', '')
       return
     }
-    const icon = theme.icon?.[MODE_META[currentMode].icon] ?? ''
-    const labeled = icon ? `${icon} ${raw}` : raw
-    const colored = theme.fg(isActive ? 'accent' : 'dim', labeled)
-    setStatus('ponytail', theme.bg ? theme.bg('statusLineBg', colored) : colored)
+    const icon = LEVEL_ICONS[currentMode] || ''
+    const label = currentMode.toUpperCase()
+    const indicator = isActive ? theme.fg('accent', '●') : theme.fg('dim', '○')
+    setStatus(
+      'ponytail',
+      indicator + ' 🐴 ' + theme.fg('muted', 'ponytail: ') + theme.fg('text', icon + ' ' + label),
+    )
   }
 
   function setMode(mode: PonytailMode, ctx: PiContext | null): void {
@@ -294,6 +294,7 @@ export default function ponytailExtension(pi: PiHost) {
     const ctx = rawCtx as PiContext | undefined
     const entries = ctx?.sessionManager?.getBranch?.() || ctx?.sessionManager?.getEntries?.() || []
     configuredDefaultMode = getDefaultMode()
+    hideStatus = getHideStatus()
     currentMode = resolveSessionMode(entries, configuredDefaultMode)
     syncStatus(ctx ?? null)
   }
