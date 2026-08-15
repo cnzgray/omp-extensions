@@ -1,0 +1,18 @@
+{
+  "name": "deepseek-v4-anchor",
+  "version": "1.0.0",
+  "description": "Anchors the first DeepSeek V4 Pro request to the DeepSeek Harness Minimal prompt and tool schema",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "omp": {
+    "name": "DeepSeek V4 Anchor",
+    "description": "Minimal-schema first-request anchoring for DeepSeek V4 Pro",
+    "extensions": ["./index.ts"]
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}

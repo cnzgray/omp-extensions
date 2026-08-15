@@ -4,7 +4,7 @@
     "name": "cnzgray"
   },
   "metadata": {
-    "description": "Oh My Pi extensions by cnzgray: ponytail, claude-auto-memory, claude-rules-bridge"
+    "description": "Oh My Pi extensions by cnzgray: ponytail, claude-auto-memory, claude-rules-bridge, deepseek-v4-anchor"
   },
   "plugins": [
     {
@@ -25,6 +25,13 @@
       "name": "claude-rules-bridge",
       "source": "./claude-rules-bridge",
       "description": "Bridges .claude/rules/*.md and *.mdc (Claude Code format) into omp as path-scoped rules",
+      "author": { "name": "cnzgray" },
+      "license": "MIT"
+    },
+    {
+      "name": "deepseek-v4-anchor",
+      "source": "./deepseek-v4-anchor",
+      "description": "Anchors the first DeepSeek V4 Pro request to the DeepSeek Harness Minimal prompt and two-tool schema",
       "author": { "name": "cnzgray" },
       "license": "MIT"
     }

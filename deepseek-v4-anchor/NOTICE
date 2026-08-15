@@ -1,0 +1,12 @@
+DeepSeek V4 Anchor includes a TypeScript port of the DeepSeek Harness
+str_replace_editor tool protocol and filesystem behavior.
+
+Upstream project: https://github.com/deepseek-ai/deepseek-harness
+Pinned source commit: 47f943859bef60e4160492346772ded9b24f765a
+Upstream files:
+- apps/cli/config/agent-presets/minimal/agent.cordis.yml
+- packages/fs/tool-str-replace-editor/src/index.ts
+- packages/shell/tool-bash-persistent/src/index.ts
+
+Portions Copyright (c) 2026 DeepSeek and licensed under the MIT License.
+See LICENSE.deepseek-harness.
