@@ -35,7 +35,20 @@ export const BASH_WIRE_TOOL = {
 export const ANCHOR_STATE_ENTRY = "deepseek-v4-anchor-state";
 
 export type AnchorPhase = "eligible" | "promoted" | "ineligible";
-export type SupportedProtocol = "openai-responses" | "anthropic-messages" | "openai-completions";
+
+export const DEV_TOOL_SEARCH_NAME = "dev_tool_search";
+export const BOOTSTRAP_TOOL_NAMES = ["bash", "str_replace_editor"] as const;
+export const RESIDENT_TOOL_NAMES = [...BOOTSTRAP_TOOL_NAMES, DEV_TOOL_SEARCH_NAME] as const;
+export const COMPACTION_TOOL_NAMES = [
+	...BOOTSTRAP_TOOL_NAMES,
+	"read",
+	"write",
+	"edit",
+	"glob",
+	"grep",
+	"todo",
+	"ask",
+] as const;
 
 export interface ModelIdentity {
 	id?: string;
@@ -51,35 +64,29 @@ export interface SessionEntryLike {
 	message?: { role?: string };
 }
 
-interface WireFunctionTool {
-	type: "function";
-	function: {
-		name: string;
-		description: string;
-		parameters: Record<string, unknown>;
-	};
+export interface AnchorSnapshot {
+	phase: AnchorPhase;
+	postCompaction: boolean;
+	unlockedTools: string[];
 }
 
 type JsonObject = Record<string, unknown>;
 
-const ANCHOR_TOOL_NAMES: Record<string, true> = {
-	bash: true,
-	str_replace_editor: true,
+const OPENAI_RESPONSES_APIS: Record<string, true> = {
+	"openai-responses": true,
+	"openai-response": true,
+	"azure-openai-responses": true,
+	"openai-codex-responses": true,
 };
+
+const RESIDENT_SYSTEM_GUIDANCE = [
+	"The visible tool catalog is intentionally small.",
+	`Use ${DEV_TOOL_SEARCH_NAME} to discover and unlock additional OMP tools; unlocked tools appear on the next model request.`,
+	"The harness and workspace instructions below remain authoritative.",
+].join(" ");
 
 function cloneSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return structuredClone(schema);
-}
-
-function wireFunctionTools(): WireFunctionTool[] {
-	return [BASH_WIRE_TOOL, STR_REPLACE_EDITOR_WIRE_TOOL].map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.function.name,
-			description: tool.function.description,
-			parameters: cloneSchema(tool.function.parameters as Record<string, unknown>),
-		},
-	}));
 }
 
 function modelCandidate(value: string): string {
@@ -96,65 +103,81 @@ export function isDeepSeekV4Pro(model: ModelIdentity | undefined): boolean {
 	return /^deepseek-v4-pro(?:$|[-:])/.test(modelCandidate(model.name));
 }
 
-export function deriveAnchorPhase(entries: readonly SessionEntryLike[]): AnchorPhase {
-	for (let index = entries.length - 1; index >= 0; index -= 1) {
-		const entry = entries[index];
+export function deriveAnchorState(entries: readonly SessionEntryLike[]): AnchorSnapshot {
+	let phase: AnchorPhase | undefined;
+	let postCompaction = false;
+	const unlockedTools = new Set<string>();
+
+	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== ANCHOR_STATE_ENTRY || !isRecord(entry.data)) continue;
-		if (entry.data.phase === "eligible") return "eligible";
-		if (entry.data.phase === "promoted") return "promoted";
+		if (entry.data.kind === "tool-unlock" && Array.isArray(entry.data.toolNames)) {
+			for (const name of entry.data.toolNames) {
+				if (typeof name === "string" && name.length > 0) unlockedTools.add(name);
+			}
+		}
+		if (entry.data.phase === "eligible") {
+			phase = "eligible";
+			postCompaction = entry.data.reason === "compaction";
+		} else if (entry.data.phase === "promoted") {
+			phase = "promoted";
+			postCompaction = false;
+		}
 	}
-	return entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant")
+
+	phase ??= entries.some((entry) => entry.type === "message" && entry.message?.role === "assistant")
 		? "ineligible"
 		: "eligible";
+	return { phase, postCompaction, unlockedTools: [...unlockedTools] };
 }
 
-export function resolveProtocol(api: string | undefined, payload: unknown): SupportedProtocol | undefined {
-	if (
-		api === "openai-responses" ||
-		api === "openai-response" ||
-		api === "azure-openai-responses" ||
-		api === "openai-codex-responses"
-	) {
-		return "openai-responses";
-	}
-	if (api === "anthropic-messages" || api === "anthropic") return "anthropic-messages";
-	if (api === "openai-completions") return "openai-completions";
-	if (!isRecord(payload)) return undefined;
-	// OpenRouter can dispatch either Responses or Chat Completions; the final
-	// provider payload is authoritative when the catalog API is ambiguous.
-	if (Array.isArray(payload.input)) return "openai-responses";
-	if (Object.hasOwn(payload, "system") && Array.isArray(payload.messages)) return "anthropic-messages";
-	if (Array.isArray(payload.messages)) return "openai-completions";
-	return undefined;
+export function isOpenAIResponsesRequest(api: string | undefined, payload: unknown): boolean {
+	if (typeof api === "string") return api in OPENAI_RESPONSES_APIS;
+	return isRecord(payload) && Array.isArray(payload.input) && !Array.isArray(payload.messages);
 }
 
-function toolName(tool: unknown, protocol: SupportedProtocol): string | undefined {
-	if (!isRecord(tool)) return undefined;
-	if (protocol === "openai-completions") {
-		return isRecord(tool.function) && typeof tool.function.name === "string" ? tool.function.name : undefined;
-	}
-	return typeof tool.name === "string" ? tool.name : undefined;
+function responseToolName(tool: unknown): string | undefined {
+	return isRecord(tool) && typeof tool.name === "string" ? tool.name : undefined;
 }
 
-export function payloadHasBootstrapExecutors(payload: unknown, protocol: SupportedProtocol): boolean {
+export function payloadHasBootstrapExecutors(payload: unknown): boolean {
 	if (!isRecord(payload) || !Array.isArray(payload.tools)) return false;
-	const names = new Set(payload.tools.map((tool) => toolName(tool, protocol)).filter((name): name is string => !!name));
+	const names = new Set(payload.tools.map(responseToolName).filter((name): name is string => !!name));
 	return names.has("bash") && names.has("str_replace_editor");
 }
 
-function dropUnsupportedForcedToolChoice(payload: JsonObject): void {
-	const choice = payload.tool_choice;
-	if (!isRecord(choice)) return;
-	const name =
-		typeof choice.name === "string"
-			? choice.name
-			: isRecord(choice.function) && typeof choice.function.name === "string"
-				? choice.function.name
-				: undefined;
-	if (name && !ANCHOR_TOOL_NAMES[name]) delete payload.tool_choice;
+function bootstrapWireTool(name: "bash" | "str_replace_editor"): JsonObject {
+	const tool = name === "bash" ? BASH_WIRE_TOOL : STR_REPLACE_EDITOR_WIRE_TOOL;
+	return {
+		type: "function",
+		name: tool.function.name,
+		description: tool.function.description,
+		parameters: cloneSchema(tool.function.parameters as Record<string, unknown>),
+	};
 }
 
-function rewriteOpenAIResponses(payload: JsonObject, tools: WireFunctionTool[]): void {
+function promptText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
+		.filter(Boolean)
+		.join("\n");
+}
+
+function currentResponsePrompt(payload: JsonObject): string {
+	const parts: string[] = [];
+	if (typeof payload.instructions === "string") parts.push(payload.instructions);
+	if (Array.isArray(payload.input)) {
+		for (const item of payload.input) {
+			if (!isRecord(item) || (item.role !== "system" && item.role !== "developer")) continue;
+			const text = promptText(item.content);
+			if (text.length > 0) parts.push(text);
+		}
+	}
+	return [...new Set(parts)].join("\n\n");
+}
+
+function writeResponsePrompt(payload: JsonObject, text: string): void {
 	const input = Array.isArray(payload.input) ? payload.input : [];
 	let promptRole: "system" | "developer" | undefined;
 	const kept = input.filter((item) => {
@@ -163,53 +186,62 @@ function rewriteOpenAIResponses(payload: JsonObject, tools: WireFunctionTool[]):
 		return false;
 	});
 	if (promptRole) {
-		payload.input = [{ role: promptRole, content: MINIMAL_SYSTEM_PROMPT }, ...kept];
+		payload.input = [{ role: promptRole, content: text }, ...kept];
 		delete payload.instructions;
 	} else {
 		payload.input = kept;
-		payload.instructions = MINIMAL_SYSTEM_PROMPT;
+		payload.instructions = text;
 	}
-	payload.tools = tools.map((tool) => ({
-		type: "function",
-		name: tool.function.name,
-		description: tool.function.description,
-		parameters: cloneSchema(tool.function.parameters),
-	}));
 }
 
-function rewriteAnthropic(payload: JsonObject, tools: WireFunctionTool[]): void {
-	payload.system = [{ type: "text", text: MINIMAL_SYSTEM_PROMPT }];
-	payload.tools = tools.map((tool) => ({
-		name: tool.function.name,
-		description: tool.function.description,
-		input_schema: cloneSchema(tool.function.parameters),
-		eager_input_streaming: true,
-	}));
+function dropUnsupportedForcedToolChoice(payload: JsonObject, allowedNames: ReadonlySet<string>): void {
+	const choice = payload.tool_choice;
+	if (!isRecord(choice)) return;
+	const name =
+		typeof choice.name === "string"
+			? choice.name
+			: isRecord(choice.function) && typeof choice.function.name === "string"
+				? choice.function.name
+				: undefined;
+	if (name && !allowedNames.has(name)) delete payload.tool_choice;
 }
 
-function rewriteOpenAICompletions(payload: JsonObject, tools: WireFunctionTool[]): void {
-	const messages = Array.isArray(payload.messages) ? payload.messages : [];
-	let promptRole: "system" | "developer" = "system";
-	const kept = messages.filter((message) => {
-		if (!isRecord(message) || (message.role !== "system" && message.role !== "developer")) return true;
-		promptRole = message.role;
-		return false;
+function rewriteResponseTools(payload: JsonObject, toolNames: readonly string[]): boolean {
+	if (!Array.isArray(payload.tools)) return false;
+	const available = new Map<string, unknown>();
+	for (const tool of payload.tools) {
+		const name = responseToolName(tool);
+		if (name) available.set(name, tool);
+	}
+	if (!available.has("bash") || !available.has("str_replace_editor")) return false;
+
+	const orderedNames = [...new Set(toolNames)];
+	payload.tools = orderedNames.flatMap((name) => {
+		if (name === "bash" || name === "str_replace_editor") return [bootstrapWireTool(name)];
+		const tool = available.get(name);
+		return tool === undefined ? [] : [tool];
 	});
-	payload.messages = [{ role: promptRole, content: MINIMAL_SYSTEM_PROMPT }, ...kept];
-	payload.tools = tools;
+	dropUnsupportedForcedToolChoice(payload, new Set(orderedNames));
+	return true;
 }
 
-/**
- * Rewrites the provider-owned request object in place. This is intentional:
- * OMP 17.3.x openai-completions observes onPayload synchronously but ignores a
- * replacement return value, while Responses and Anthropic accept both styles.
- */
-export function rewriteAnchoredPayload(payload: unknown, protocol: SupportedProtocol): boolean {
+export function promotedSystemPrompt(originalPrompt: string): string {
+	let remainder = originalPrompt.trim();
+	if (remainder.startsWith(MINIMAL_SYSTEM_PROMPT)) remainder = remainder.slice(MINIMAL_SYSTEM_PROMPT.length).trim();
+	if (remainder.startsWith(RESIDENT_SYSTEM_GUIDANCE)) remainder = remainder.slice(RESIDENT_SYSTEM_GUIDANCE.length).trim();
+	return [MINIMAL_SYSTEM_PROMPT, RESIDENT_SYSTEM_GUIDANCE, remainder].filter(Boolean).join("\n\n");
+}
+
+export function rewriteControlledPayload(payload: unknown, toolNames: readonly string[] = BOOTSTRAP_TOOL_NAMES): boolean {
+	if (!isRecord(payload) || !rewriteResponseTools(payload, toolNames)) return false;
+	writeResponsePrompt(payload, MINIMAL_SYSTEM_PROMPT);
+	return true;
+}
+
+export function rewritePromotedPayload(payload: unknown, toolNames: readonly string[]): boolean {
 	if (!isRecord(payload)) return false;
-	const tools = wireFunctionTools();
-	if (protocol === "openai-responses") rewriteOpenAIResponses(payload, tools);
-	else if (protocol === "anthropic-messages") rewriteAnthropic(payload, tools);
-	else rewriteOpenAICompletions(payload, tools);
-	dropUnsupportedForcedToolChoice(payload);
+	const originalPrompt = currentResponsePrompt(payload);
+	if (!rewriteResponseTools(payload, toolNames)) return false;
+	writeResponsePrompt(payload, promotedSystemPrompt(originalPrompt));
 	return true;
 }

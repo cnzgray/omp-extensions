@@ -122,7 +122,7 @@ interface EditorToolResult {
 	content: Array<{ type: "text"; text: string }>;
 }
 
-interface EditorToolDefinition {
+export interface EditorToolDefinition {
 	name: string;
 	label: string;
 	description: string;

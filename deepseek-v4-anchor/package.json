@@ -1,7 +1,7 @@
 {
   "name": "deepseek-v4-anchor",
-  "version": "1.0.0",
-  "description": "Anchors the first DeepSeek V4 Pro request to the DeepSeek Harness Minimal prompt and tool schema",
+  "version": "1.1.0",
+  "description": "Keeps DeepSeek V4 Pro on a Minimal-aligned bootstrap and resident tool trajectory",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
   },
   "omp": {
     "name": "DeepSeek V4 Anchor",
-    "description": "Minimal-schema first-request anchoring for DeepSeek V4 Pro",
+    "description": "Responses-only Minimal bootstrap with resident tool discovery for DeepSeek V4 Pro",
     "extensions": ["./index.ts"]
   },
   "devDependencies": {

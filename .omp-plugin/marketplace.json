@@ -31,7 +31,7 @@
     {
       "name": "deepseek-v4-anchor",
       "source": "./deepseek-v4-anchor",
-      "description": "Anchors the first DeepSeek V4 Pro request to the DeepSeek Harness Minimal prompt and two-tool schema",
+      "description": "Minimal bootstrap and resident on-demand tool discovery for DeepSeek V4 Pro on OpenAI Responses",
       "author": { "name": "cnzgray" },
       "license": "MIT"
     }

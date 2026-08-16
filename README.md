@@ -17,13 +17,15 @@ omp plugin install claude-auto-memory@omp-extensions
 | `ponytail` | 懒人模式: 强制使用最简单可行方案(vendored hooks,不依赖 Claude Code 安装) |
 | `claude-auto-memory` | 自动生成的项目记忆(Claude Code 风格) |
 | `claude-rules-bridge` | 把 `.claude/rules/*.md` / `*.mdc` 桥接为 omp 路径作用域规则 |
-| `deepseek-v4-anchor` | DeepSeek V4 Pro 首请求锚定：Minimal system prompt + 精确 `bash` / `str_replace_editor` 工具协议；回复后恢复 OMP 工具与上下文 |
+| `deepseek-v4-anchor` | DeepSeek V4 Pro 两阶段锚定：Minimal 首请求；晋升后保持 persona-first resident 工具集并按需解锁 |
 
-`deepseek-v4-anchor` 安装后自动匹配各 provider 下的 `deepseek-v4-pro`（含日期/tag SKU）。
-仅空白会话首请求和成功压缩后的首请求进入严格锚定；该请求会临时移除 OMP/项目系统上下文，
-并只暴露 DeepSeek Harness Minimal 的 `bash` 与 `str_replace_editor` 协议。首个 assistant 消息落盘后，
-后续请求恢复正常 OMP system prompt 与工具目录。支持 OpenAI Responses、Anthropic Messages，
-并兼容 OpenAI Chat Completions。
+`deepseek-v4-anchor` 安装后自动匹配各 provider 下的 `deepseek-v4-pro`（含日期/tag SKU），
+但行为锚定仅在 OpenAI Responses 协议启用；其他协议保持原请求并告警。空白会话首请求只暴露
+DeepSeek Harness Minimal 的 `bash` 与 `str_replace_editor` 协议。首个成功 assistant 消息完成后，
+后续请求保持 Minimal persona 打头，并只暴露 resident 集：上述两工具加 `dev_tool_search`。
+模型可通过 `dev_tool_search` 搜索并持久解锁其他 OMP 工具；resume、分支和树导航会从 session
+entries 恢复解锁集。成功压缩后先进入 Minimal 工具加 `read`/`write`/`edit`/`glob`/`grep`/
+`todo`/`ask` 的受控 epoch，产生新 assistant 消息后再回到 resident 集。
 
 ## 本地开发
 
